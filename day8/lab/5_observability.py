@@ -74,18 +74,14 @@ except ImportError:
 
 try:
     import pandas as pd
-    import numpy as np
-    if not hasattr(np, 'float_'):
-        np.float_ = np.float64
 except ImportError:
     print("[ERROR] pandas not installed. Run: pip install pandas")
     sys.exit(1)
 
 # Evidently import — graceful fallback if not installed
 try:
-    from evidently.report import Report
-    from evidently.metrics import DatasetSummaryMetric, DatasetMissingValuesMetric
-    from evidently.metric_preset import DataDriftPreset
+    from evidently import Report
+    from evidently.presets import DataSummaryPreset, DataDriftPreset
     EVIDENTLY_AVAILABLE = True
 except ImportError:
     EVIDENTLY_AVAILABLE = False
@@ -159,17 +155,17 @@ def run_quality_report(silver_df: pd.DataFrame) -> dict:
     """
     print("\n[Evidently] Step 2: Generating DataQualityReport for Silver layer...")
 
-    # DataQualityPreset includes DatasetCorrelationsMetric which crashes on read-only
-    # numpy arrays in Evidently 0.7.x — use individual metrics instead
-    report = Report(metrics=[DatasetSummaryMetric(), DatasetMissingValuesMetric()])
-    report.run(current_data=silver_df.copy(deep=True), reference_data=None)
+    report = Report(metrics=[DataSummaryPreset()])
+    # Evidently needs a reference — use the Silver DF as both current and reference
+    # (quality report does not require a separate reference dataset)
+    snapshot = report.run(current_data=silver_df, reference_data=None)
 
     html_path = os.path.join(OBS_DIR, "silver_quality_report.html")
-    report.save_html(html_path)
+    snapshot.save_html(html_path)
     print(f"[OK] Saved: devops_brain/observability/silver_quality_report.html")
 
     # Extract key metrics from the JSON result for downstream use
-    result_dict = report.as_dict()
+    result_dict = snapshot.dict()
     metrics_summary = _extract_quality_summary(result_dict, silver_df)
     return metrics_summary
 
@@ -216,34 +212,54 @@ def run_drift_report(bronze_df: pd.DataFrame, silver_df: pd.DataFrame) -> dict:
         ref_df = ref_df.sample(n=len(curr_df), random_state=42)
 
     report = Report(metrics=[DataDriftPreset()])
-    report.run(reference_data=ref_df.copy(deep=True), current_data=curr_df.copy(deep=True))
+    snapshot = report.run(reference_data=ref_df, current_data=curr_df)
 
     html_path = os.path.join(OBS_DIR, "bronze_silver_drift_report.html")
-    report.save_html(html_path)
+    snapshot.save_html(html_path)
     print(f"[OK] Saved: devops_brain/observability/bronze_silver_drift_report.html")
 
     # Extract drift summary
-    result_dict = report.as_dict()
+    result_dict = snapshot.dict()
     drift_summary = _extract_drift_summary(result_dict, shared_cols)
     return drift_summary
 
 
 def _extract_drift_summary(result_dict: dict, columns: list) -> dict:
     """Pull drift flags from Evidently JSON output."""
-    # Walk the nested metrics structure to find dataset drift result
     drifted_cols = []
     drift_share  = None
     dataset_drifted = False
 
     try:
-        for metric in result_dict.get("metrics", []):
-            result = metric.get("result", {})
-            if "drift_share" in result:
-                drift_share     = result["drift_share"]
-                dataset_drifted = result.get("dataset_drift", False)
-                for col, col_result in result.get("drift_by_columns", {}).items():
-                    if col_result.get("drift_detected", False):
+        # Check if this is the new Evidently 0.7+ format
+        is_v2 = any(metric.get("config", {}).get("type", "").startswith("evidently:metric_v2:") for metric in result_dict.get("metrics", []))
+        
+        if is_v2:
+            for metric in result_dict.get("metrics", []):
+                cfg = metric.get("config", {})
+                m_type = cfg.get("type", "")
+                val = metric.get("value", {})
+                
+                if m_type == "evidently:metric_v2:DriftedColumnsCount":
+                    if isinstance(val, dict):
+                        drift_share = val.get("share")
+                        threshold = cfg.get("drift_share", 0.5)
+                        dataset_drifted = drift_share >= threshold if drift_share is not None else False
+                elif m_type == "evidently:metric_v2:ValueDrift":
+                    col = cfg.get("column")
+                    threshold = cfg.get("threshold", 0.05)
+                    if col and isinstance(val, (int, float)) and val <= threshold:
                         drifted_cols.append(col)
+        else:
+            # Legacy format
+            for metric in result_dict.get("metrics", []):
+                result = metric.get("result", {})
+                if "drift_share" in result:
+                    drift_share     = result["drift_share"]
+                    dataset_drifted = result.get("dataset_drift", False)
+                    for col, col_result in result.get("drift_by_columns", {}).items():
+                        if col_result.get("drift_detected", False):
+                            drifted_cols.append(col)
     except Exception:
         pass
 
